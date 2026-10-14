@@ -38,6 +38,7 @@ class SimulationType(StrEnum):
 
     REGULAR = "REGULAR"
     SUPER = "SUPER"
+    COMBO = "COMBO"
     REGION_AGNOSTIC = "REGION_AGNOSTIC"
     RA_PARENT = "RA_PARENT"
     RA_CHILD = "RA_CHILD"
@@ -207,6 +208,54 @@ class SimulationRequest(BrainModel):
         """
         if self.settings.region == REGION_AGNOSTIC_REGION:
             self.type = SimulationType.REGION_AGNOSTIC
+        return self
+
+    @model_validator(mode="after")
+    def _validate_formulas(self) -> Self:
+        """Ensure expressions are non-empty and parse cleanly before entering queues."""
+        from ..labs.fastexpr import ParseError, parse
+
+        formulas_to_check: list[tuple[str, str | None]] = []
+        if self.type in (SimulationType.REGULAR, SimulationType.REGION_AGNOSTIC):
+            if not self.regular or not self.regular.strip():
+                raise ValueError(
+                    f"Simulation type {self.type.value} requires a non-empty 'regular' expression."
+                )
+            if self.combo and self.combo.strip():
+                raise ValueError(
+                    f"Simulation type {self.type.value} does not accept a 'combo' expression."
+                )
+            if self.selection and self.selection.strip():
+                raise ValueError(
+                    f"Simulation type {self.type.value} does not accept a 'selection' expression."
+                )
+            formulas_to_check.append(("regular", self.regular))
+        elif self.type == SimulationType.COMBO:
+            if not self.combo or not self.combo.strip():
+                raise ValueError("Simulation type COMBO requires a non-empty 'combo' expression.")
+            if self.regular and self.regular.strip():
+                raise ValueError("Simulation type COMBO does not accept a 'regular' expression.")
+            if self.selection and self.selection.strip():
+                raise ValueError("Simulation type COMBO does not accept a 'selection' expression.")
+            formulas_to_check.append(("combo", self.combo))
+        elif self.type == SimulationType.SUPER:
+            if not self.selection or not self.selection.strip():
+                raise ValueError(
+                    "Simulation type SUPER requires a non-empty 'selection' expression."
+                )
+            if not self.combo or not self.combo.strip():
+                raise ValueError("Simulation type SUPER requires a non-empty 'combo' expression.")
+            if self.regular and self.regular.strip():
+                raise ValueError("Simulation type SUPER does not accept a 'regular' expression.")
+            formulas_to_check.append(("selection", self.selection))
+            formulas_to_check.append(("combo", self.combo))
+
+        for name, expr in formulas_to_check:
+            if expr is not None:
+                try:
+                    parse(expr)
+                except (ParseError, ValueError) as exc:
+                    raise ValueError(f"Malformed {name} expression: {exc}") from exc
         return self
 
     def to_wire(self) -> dict[str, Any]:

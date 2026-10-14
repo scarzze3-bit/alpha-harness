@@ -42,12 +42,15 @@ from ..vault.store import EVOLVABLE_TYPES, SEEDABLE
 from ..vault.yields import IGNORED_CHECKS, SUBMITTED, checks_of, is_submitted
 from . import search
 from .fastexpr import (
+    MAX_FIELDS,
+    MAX_OPERATORS,
     UNCOUNTED,
     Node,
     OperatorInfo,
     ParseError,
     Path,
     crossover,
+    data_fields,
     node_at,
     operator_count,
     operator_table,
@@ -139,7 +142,7 @@ def utility(row: dict[str, Any]) -> float:
 
 def pass_rate(checks: list[Any]) -> float | None:
     """The share of judged checks passed; pending, labelling and test-year checks are not judged."""
-    skipped = IGNORED_CHECKS | TEST_YEAR_CHECKS
+    skipped = set(IGNORED_CHECKS) | TEST_YEAR_CHECKS
     judged = [
         str(c.get("result", "")).upper()
         for c in checks
@@ -149,16 +152,43 @@ def pass_rate(checks: list[Any]) -> float | None:
     return sum(r == "PASS" for r in judged) / len(judged) if judged else None
 
 
-def seed_score(row: dict[str, Any]) -> float:
-    """Utility scaled by the checks passed, the notes' S x (1 + passed / total).
+#: Research heuristic multipliers for held-out validation stability.
+HEURISTIC_OOS_BONUS: float = 1.25
+HEURISTIC_OOS_PENALTY: float = 0.50
+RATIO_STABLE: float = 0.50
+RATIO_COLLAPSE: float = 0.25
 
-    A negative score is divided instead, so passing more checks always ranks higher.
+
+def seed_score(row: dict[str, Any]) -> float:
+    """Utility scaled by the checks passed, with provisional held-out validation weighting.
+
+    When out-of-sample evaluation metrics are present, alphas maintaining stability
+    (test_sharpe / train_sharpe >= RATIO_STABLE) receive HEURISTIC_OOS_BONUS; alphas that
+    collapsed out-of-sample (< RATIO_COLLAPSE or <= 0) receive HEURISTIC_OOS_PENALTY.
+    If held-out metrics are absent, invalid, or non-finite, the base score is preserved.
+    A negative score is divided by (1 + rate), so passing more checks always ranks higher.
     """
     score = utility(row)
-    rate = pass_rate(checks_of(row.get("checks")))
-    if rate is None or not math.isfinite(score):
+    if not math.isfinite(score):
         return score
-    return score * (1 + rate) if score >= 0 else score / (1 + rate)
+    rate = pass_rate(checks_of(row.get("checks")))
+    base = score if rate is None else (score * (1 + rate) if score >= 0 else score / (1 + rate))
+    test_raw = row.get("test_sharpe")
+    train_raw = row.get("train_sharpe")
+    if test_raw is not None and train_raw is not None:
+        try:
+            test_sharpe = float(test_raw)
+            train_sharpe = float(train_raw)
+            if math.isfinite(test_sharpe) and math.isfinite(train_sharpe) and train_sharpe > 0:
+                ratio = test_sharpe / train_sharpe
+                if math.isfinite(ratio):
+                    if ratio >= RATIO_STABLE and test_sharpe > 0:
+                        base *= HEURISTIC_OOS_BONUS
+                    elif ratio < RATIO_COLLAPSE or test_sharpe <= 0:
+                        base *= HEURISTIC_OOS_PENALTY
+        except ValueError, TypeError:
+            pass
+    return base
 
 
 def population_for(simulations: int, chosen: int | None = None) -> int:
@@ -421,12 +451,22 @@ def mutate(
 
 
 def child(
-    rng: random.Random, a: Parent, b: Parent, market: Market, rate: float
+    rng: random.Random,
+    a: Parent,
+    b: Parent,
+    market: Market,
+    rate: float,
+    *,
+    max_operators: int | None = None,
+    max_fields: int | None = None,
 ) -> tuple[Node, dict[str, Any]] | None:
     """A valid child of ``a`` and ``b`` that is neither of them, or ``None`` after ten tries."""
     genes = market.genes(a.tree)
     same = skeleton(a.tree, genes) == skeleton(b.tree, market.genes(b.tree))
-    limit = max(operator_count(a.tree), operator_count(b.tree))
+    parent_ops = max(operator_count(a.tree), operator_count(b.tree))
+    op_limit = max_operators if max_operators is not None else max(MAX_OPERATORS, parent_ops)
+    parent_fields = max(len(data_fields(a.tree)), len(data_fields(b.tree)))
+    field_limit = max_fields if max_fields is not None else max(MAX_FIELDS, parent_fields)
     parents = {a.key, b.key}
 
     def clone(tree: Node, settings: dict[str, Any]) -> bool:
@@ -438,8 +478,17 @@ def child(
         if same:
             tree = uniform(rng, a.tree, b.tree, genes)
         else:
-            tree = crossover(rng, left.tree, right.tree) or left.tree
-            if operator_count(tree) > limit:
+            tree = (
+                crossover(
+                    rng,
+                    left.tree,
+                    right.tree,
+                    max_operators=op_limit,
+                    max_fields=field_limit,
+                )
+                or left.tree
+            )
+            if operator_count(tree) > op_limit or len(data_fields(tree)) > field_limit:
                 continue
         settings = {
             "neutralization": rng.choice((a.neutralization, b.neutralization)),
@@ -449,7 +498,12 @@ def child(
         tree, settings = mutate(rng, tree, settings, market, rate)
         if clone(tree, settings):
             tree, settings = mutate(rng, tree, settings, market, 0.0, force=True)
-        if clone(tree, settings) or validate(tree, market.table, market.names):
+        if (
+            clone(tree, settings)
+            or operator_count(tree) > op_limit
+            or len(data_fields(tree)) > field_limit
+            or validate(tree, market.table, market.names)
+        ):
             continue
         return tree, settings
     return None

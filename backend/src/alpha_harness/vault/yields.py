@@ -101,7 +101,7 @@ def without_quota_checks(checks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [c for c in checks if str(c.get("name", "")).upper() not in QUOTA_CHECKS]
 
 
-def checks_of(checks_json: str | None) -> list[dict[str, Any]]:
+def checks_of(checks_json: str | list[dict[str, Any]] | None) -> list[dict[str, Any]]:
     """The stored checks array, or empty when missing or unreadable.
 
     Quota checks are dropped here as well as on the way in, so rows written before they were
@@ -109,6 +109,8 @@ def checks_of(checks_json: str | None) -> list[dict[str, Any]]:
     """
     if not checks_json:
         return []
+    if isinstance(checks_json, list):
+        return without_quota_checks(checks_json)
     try:
         checks = json.loads(checks_json)
     except json.JSONDecodeError, TypeError:

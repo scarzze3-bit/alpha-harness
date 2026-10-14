@@ -43,6 +43,7 @@ from .lifecycle import (
     extract_simulation_id,
     finish,
     hash_payload,
+    legacy_request_hash,
     new_record,
     record_launch,
     request_hash,
@@ -232,13 +233,16 @@ class BatchEngine:
                 request_hash(asked) if sent is not asked else None
                 for sent, asked in zip(moded, requests, strict=True)
             ]
+            legacies = [legacy_request_hash(r) for r in moded]
             known: dict[str, str] = {}
             #: Hash -> an active row's id, or the row this call is adding for it.
             in_flight: dict[str, int | SimulationRecord] = {}
             # Looked up in bulk — a harvest enqueues thousands, and two reads per request
             # would scale queueing with round-trips — and chunked to stay under SQLite's
             # variable cap.
-            looked_up = set(hashes) | {full for full in fulls if full}
+            looked_up = (
+                set(hashes) | {full for full in fulls if full} | {leg for leg in legacies if leg}
+            )
             for chunk in itertools.batched(looked_up, ENQUEUE_CHUNK, strict=False):
                 for entry in await session.scalars(
                     select(DedupEntry).where(DedupEntry.request_hash.in_(chunk))
@@ -256,9 +260,13 @@ class BatchEngine:
 
             # (index, hash, status, alpha id, the row: new, or an existing row's id)
             plan: list[tuple[int, str, SimStatus, str | None, int | SimulationRecord]] = []
-            for index, (request, digest, full) in enumerate(zip(moded, hashes, fulls, strict=True)):
-                if full in known or digest in known:
-                    alpha_id = known[full] if full in known else known[digest]
+            for index, (request, digest, full, legacy) in enumerate(
+                zip(moded, hashes, fulls, legacies, strict=True)
+            ):
+                alpha_id = (
+                    known.get(digest) or (known.get(full) if full else None) or known.get(legacy)
+                )
+                if alpha_id:
                     record = new_record(
                         request,
                         task=task,
@@ -268,11 +276,15 @@ class BatchEngine:
                         finished_at=utcnow(),
                     )
                     session.add(record)
+                    if digest not in known:
+                        session.add(DedupEntry(request_hash=digest, alpha_id=alpha_id))
+                        known[digest] = alpha_id
                     plan.append((index, digest, SimStatus.SKIPPED, alpha_id, record))
-                elif digest in in_flight:
+                elif digest in in_flight or legacy in in_flight:
                     # Same payload still queued or running (possibly from earlier in this
                     # call): share that row, so its result reaches both callers for one run.
-                    plan.append((index, digest, SimStatus.SKIPPED, None, in_flight[digest]))
+                    target_row = in_flight.get(digest) or in_flight[legacy]
+                    plan.append((index, digest, SimStatus.SKIPPED, None, target_row))
                 else:
                     record = new_record(request, task=task, status=SimStatus.QUEUED)
                     session.add(record)

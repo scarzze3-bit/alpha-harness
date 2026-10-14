@@ -25,6 +25,7 @@ from .config import BRAIN_API_BASE, Settings
 from .db.duck import Catalog
 from .db.models import SimStatus, SimulationRecord, utcnow
 from .db.sqlite import Database, snapshot
+from .engine.lifecycle import rekey_historical_dedup
 from .engine.slots import BatchEngine
 from .engine.tracker import SimulationTracker
 from .labs.study import Optimizer
@@ -128,6 +129,7 @@ class AppState:
         await self.catalog.open()
         await asyncio.to_thread(snapshot, self.settings.sqlite_path, updates.current())
         await self.db.create_all()
+        await rekey_historical_dedup(self.db)
         preferences.apply(self, await preferences.load(self.db))
         await self.models.load()
         # A catalog downloaded before the search index existed still has none; building it

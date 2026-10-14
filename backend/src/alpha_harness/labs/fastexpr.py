@@ -129,7 +129,7 @@ _TOKEN = re.compile(
     r"""\s*(?:
         (?P<num>(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)
       | (?P<str>"[^"]*"|'[^']*')
-      | (?P<name>\$?[A-Za-z_]\w*|\.\.\.)
+      | (?P<name>\$?[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*|\.\.\.)
       | (?P<op>&&|\|\||==|!=|<=|>=|[-+*/^<>!?:(),=;])
     )""",
     re.VERBOSE,
@@ -337,6 +337,24 @@ def render(node: Node) -> str:
             raise ValueError(f"Unknown node kind {node.kind!r}")
 
 
+def canonical_formula(expr: str | None) -> str | None:
+    """Canonical form of an alpha expression for deduplication and display.
+
+    If the expression parses cleanly into an AST, strips comments and superfluous whitespace
+    and re-renders deterministically so formatting variations share identity.
+    If the expression is empty or malformed (raises ParseError or ValueError), the original
+    raw string is preserved as-is so invalid syntax is never silently altered.
+    """
+    if not expr:
+        return expr
+    if not expr.strip():
+        return ""
+    try:
+        return render(parse(expr))
+    except ParseError, ValueError:
+        return expr
+
+
 # -- walking ---------------------------------------------------------------
 
 Path = tuple[int, ...]
@@ -392,6 +410,7 @@ def data_fields(tree: Node, *, grouping: bool = False) -> list[str]:
             if n.kind == "name"
             and not (path and path[-1] >= len(node_at(tree, path[:-1]).args))
             and n.value not in assigned
+            and n.value.split(".")[0] not in assigned
             and (grouping or n.value not in GROUPING)
             and n.value.lower() not in ("true", "false", "nan")
         )
@@ -430,18 +449,41 @@ def protected(tree: Node, path: Path) -> bool:
 # -- changing --------------------------------------------------------------
 
 
-def crossover(rng: random.Random, left: Node, right: Node) -> Node | None:
+def crossover(
+    rng: random.Random,
+    left: Node,
+    right: Node,
+    *,
+    max_operators: int | None = None,
+    max_fields: int | None = None,
+) -> Node | None:
     """Graft a call from one parent in place of a call inside the other.
 
     The left root is never replaced (that would just be the other parent), and grouping
     and keyword slots are never exchanged.
+    If constraints are provided, candidate graft pairs are evaluated in random order,
+    rejecting any graft that exceeds ``max_operators`` or ``max_fields``.
     """
     mine = [p for p, n in walk(left) if p and n.kind == "call" and not protected(left, p)]
     theirs = [n for p, n in walk(right) if n.kind == "call" and not protected(right, p)]
     if not mine or not theirs:
         return None
-    child = replace_at(left, rng.choice(mine), rng.choice(theirs))
-    return None if child == left else child
+    if max_operators is None and max_fields is None:
+        child = replace_at(left, rng.choice(mine), rng.choice(theirs))
+        return None if child == left else child
+
+    pairs = [(p, n) for p in mine for n in theirs]
+    rng.shuffle(pairs)
+    for slot, graft in pairs:
+        child = replace_at(left, slot, graft)
+        if child == left:
+            continue
+        if max_operators is not None and operator_count(child) > max_operators:
+            continue
+        if max_fields is not None and len(data_fields(child)) > max_fields:
+            continue
+        return child
+    return None
 
 
 def validate(

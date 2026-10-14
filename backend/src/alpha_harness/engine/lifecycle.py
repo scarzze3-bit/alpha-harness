@@ -17,15 +17,18 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import urlparse
 
-from sqlalchemy import case, update
+from sqlalchemy import case, select, update
 
 from ..brain.errors import BrainError
 from ..brain.schemas import FULL_MODE, SimulationRequest, SimulationStatus, SimulationType
 from ..db.models import ACTIVE, DedupEntry, QuotaSnapshot, SimStatus, SimulationRecord, utcnow
+from ..labs.fastexpr import canonical_formula
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
     from datetime import datetime
+
+    from ..db.sqlite import Database
 
 #: Most regions a region-agnostic simulation is translated into, and so the most cores and
 #: daily simulations one can cost ("Concurrent simulation quota: counts the sum of RA Child
@@ -103,9 +106,8 @@ def hash_payload(payload: Any) -> str:
     return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
 
 
-def request_hash(request: SimulationRequest) -> str:
-    """What an identical request shares. ``FULL`` is BRAIN's default, so naming it changes
-    nothing: a Full re-run matches every Alpha simulated before modes were sent."""
+def legacy_request_hash(request: SimulationRequest) -> str:
+    """Historical hash: SHA-256 of payload without formula canonicalization."""
     payload = request.to_wire()
     settings = payload.get("settings")
     if isinstance(settings, dict) and settings.get("simulationMode") == FULL_MODE:
@@ -113,10 +115,70 @@ def request_hash(request: SimulationRequest) -> str:
     return hash_payload(payload)
 
 
+def request_hash(request: SimulationRequest) -> str:
+    """What an identical request shares. ``FULL`` is BRAIN's default, so naming it changes
+    nothing: a Full re-run matches every Alpha simulated before modes were sent."""
+    payload = request.to_wire()
+    settings = payload.get("settings")
+    if isinstance(settings, dict) and settings.get("simulationMode") == FULL_MODE:
+        del settings["simulationMode"]
+    for key in ("regular", "combo", "selection"):
+        if key in payload and isinstance(payload[key], str):
+            payload[key] = canonical_formula(payload[key])
+    return hash_payload(payload)
+
+
 async def remember(session: Any, record: SimulationRecord, alpha_id: str) -> None:
     """Record what this payload produced, so an identical request reuses it for free."""
     if await session.get(DedupEntry, record.request_hash) is None:
         session.add(DedupEntry(request_hash=record.request_hash, alpha_id=alpha_id))
+
+
+async def rekey_historical_dedup(db: Database) -> int:
+    """Ensure canonical hashes exist in DedupEntry for all historical simulation records.
+
+    Preserves all existing records and legacy hashes without deletion. If a historical simulation
+    produced an alpha but was recorded under a legacy hash (or before canonicalization), this
+    computes the canonical hash from its stored payload and adds a matching DedupEntry.
+    """
+    rekeyed = 0
+    async with db.session() as session:
+        stmt = select(SimulationRecord).where(
+            SimulationRecord.alpha_id.isnot(None),
+            SimulationRecord.payload.isnot(None),
+        )
+        records = (await session.scalars(stmt)).all()
+        if not records:
+            return 0
+
+        candidate_entries: list[tuple[str, str]] = []
+        for rec in records:
+            if not rec.payload or not rec.alpha_id:
+                continue
+            try:
+                req = SimulationRequest.model_validate(rec.payload)
+                c_hash = request_hash(req)
+                candidate_entries.append((c_hash, rec.alpha_id))
+            except ValueError, TypeError, KeyError:
+                pass
+
+        if not candidate_entries:
+            return 0
+
+        unique_hashes = {h for h, _ in candidate_entries}
+        existing = set(
+            await session.scalars(
+                select(DedupEntry.request_hash).where(DedupEntry.request_hash.in_(unique_hashes))
+            )
+        )
+
+        for c_hash, alpha_id in candidate_entries:
+            if c_hash not in existing:
+                session.add(DedupEntry(request_hash=c_hash, alpha_id=alpha_id))
+                existing.add(c_hash)
+                rekeyed += 1
+
+    return rekeyed
 
 
 # -- writes ------------------------------------------------------------------
